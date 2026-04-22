@@ -1,25 +1,37 @@
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
-const play = require('play-dl');
-require('dotenv/config');
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } from 'discord.js';
+import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } from '@discordjs/voice';
+import { stream } from 'play-dl';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+// Environment variables
+const TOKEN = process.env.BOT_TOKEN;
+const PANEL_CHANNEL_ID = process.env.PANEL_CHANNEL_ID;
+const TICKET_CATEGORY_ID = process.env.TICKET_CATEGORY_ID;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
+
+// Validate required env vars
+if (!TOKEN) {
+    console.error('❌ BOT_TOKEN is required in environment variables');
+    process.exit(1);
+}
 
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.GuildVoiceStates
     ]
 });
 
-// Store active connections and players
-const musicQueues = new Map();
+// Store active connections
+const activePlayers = new Map();
 
 client.once('ready', async () => {
-    console.log(`✅ Logged in as ${client.user.tag}`);
+    console.log(`✅ Bot online as ${client.user.tag}`);
     
     // Register slash command
-    const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
+    const rest = new REST({ version: '10' }).setToken(TOKEN);
     
     try {
         await rest.put(
@@ -27,201 +39,106 @@ client.once('ready', async () => {
             { body: [
                 new SlashCommandBuilder()
                     .setName('ms')
-                    .setDescription('Play music from a link in your voice channel')
+                    .setDescription('Play music from a link')
                     .addStringOption(option =>
                         option.setName('link')
                             .setDescription('YouTube or music link')
                             .setRequired(true))
-                    .toJSON()
             ] }
         );
-        console.log('✅ Slash commands registered');
+        console.log('✅ Slash command /ms registered');
     } catch (error) {
-        console.error('Error registering commands:', error);
+        console.error('Failed to register command:', error);
     }
 });
 
-async function playMusic(guildId, voiceChannel, textChannel, url) {
-    try {
-        // Get or create queue for this guild
-        if (!musicQueues.has(guildId)) {
-            musicQueues.set(guildId, { connection: null, player: null, queue: [], current: null });
-        }
-        
-        const guildQueue = musicQueues.get(guildId);
-        
-        // Validate URL and get stream
-        let stream;
-        let title;
-        
-        if (url.includes('youtube.com') || url.includes('youtu.be')) {
-            const video = await play.video_info(url);
-            title = video.video_details.title;
-            stream = await play.stream(url);
-        } else {
-            // Try searching YouTube
-            const searchResult = await play.search(url, { limit: 1 });
-            if (searchResult.length === 0) throw new Error('No results found');
-            const video = await play.video_info(searchResult[0].url);
-            title = video.video_details.title;
-            stream = await play.stream(searchResult[0].url);
-        }
-        
-        const resource = createAudioResource(stream.stream, {
-            inputType: stream.type,
-            inlineVolume: true
-        });
-        
-        resource.volume.setVolume(0.5);
-        
-        // If no connection exists, create one
-        if (!guildQueue.connection) {
-            const connection = joinVoiceChannel({
-                channelId: voiceChannel.id,
-                guildId: voiceChannel.guild.id,
-                adapterCreator: voiceChannel.guild.voiceAdapterCreator
-            });
-            
-            guildQueue.connection = connection;
-            guildQueue.player = createAudioPlayer();
-            
-            connection.subscribe(guildQueue.player);
-            
-            // Handle connection errors
-            connection.on(VoiceConnectionStatus.Disconnected, async () => {
-                musicQueues.delete(guildId);
-                if (textChannel) {
-                    const embed = new EmbedBuilder()
-                        .setColor(0xFF0000)
-                        .setDescription('🔌 Disconnected from voice channel');
-                    await textChannel.send({ embeds: [embed] });
-                }
-            });
-        }
-        
-        // Add to queue
-        guildQueue.queue.push({ resource, title, url });
-        
-        // Send confirmation
-        const embed = new EmbedBuilder()
-            .setColor(0x00FF00)
-            .setDescription(`✅ Added to queue: **${title}**\nPosition: ${guildQueue.queue.length}`);
-        await textChannel.send({ embeds: [embed] });
-        
-        // Log to log channel
-        const logChannel = client.channels.cache.get(process.env.LOG_CHANNEL_ID);
-        if (logChannel) {
-            const logEmbed = new EmbedBuilder()
-                .setColor(0x0099FF)
-                .setTitle('🎵 Music Played')
-                .addFields(
-                    { name: 'User', value: `<@${textChannel.lastMessage?.author?.id || 'Unknown'}>` },
-                    { name: 'Song', value: title },
-                    { name: 'Channel', value: `<#${textChannel.id}>` }
-                )
-                .setTimestamp();
-            await logChannel.send({ embeds: [logEmbed] });
-        }
-        
-        // Start playing if not already
-        if (guildQueue.player.state.status !== AudioPlayerStatus.Playing) {
-            playNext(guildId, textChannel);
-        }
-        
-    } catch (error) {
-        console.error('Error playing music:', error);
-        const errorEmbed = new EmbedBuilder()
-            .setColor(0xFF0000)
-            .setDescription(`❌ Error: ${error.message}`);
-        await textChannel.send({ embeds: [errorEmbed] });
-    }
-}
-
-async function playNext(guildId, textChannel) {
-    const guildQueue = musicQueues.get(guildId);
-    if (!guildQueue || guildQueue.queue.length === 0) {
-        // No more songs, disconnect after 5 minutes of inactivity
-        setTimeout(() => {
-            const currentQueue = musicQueues.get(guildId);
-            if (currentQueue && currentQueue.queue.length === 0 && currentQueue.player.state.status !== AudioPlayerStatus.Playing) {
-                if (currentQueue.connection) {
-                    currentQueue.connection.destroy();
-                    musicQueues.delete(guildId);
-                    const embed = new EmbedBuilder()
-                        .setColor(0xFFA500)
-                        .setDescription('👋 Queue empty, disconnected from voice channel');
-                    if (textChannel) textChannel.send({ embeds: [embed] });
-                }
-            }
-        }, 300000);
-        return;
-    }
-    
-    const nextSong = guildQueue.queue.shift();
-    guildQueue.current = nextSong;
-    
-    guildQueue.player.play(nextSong.resource);
-    
-    const nowPlayingEmbed = new EmbedBuilder()
-        .setColor(0x00FF00)
-        .setDescription(`🎵 Now playing: **${nextSong.title}**`);
-    if (textChannel) await textChannel.send({ embeds: [nowPlayingEmbed] });
-    
-    guildQueue.player.once(AudioPlayerStatus.Idle, () => {
-        playNext(guildId, textChannel);
-    });
-    
-    guildQueue.player.on('error', error => {
-        console.error('Player error:', error);
-        playNext(guildId, textChannel);
-    });
-}
-
 client.on('interactionCreate', async interaction => {
-    if (!interaction.isCommand()) return;
+    if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName !== 'ms') return;
     
     await interaction.deferReply();
     
     const link = interaction.options.getString('link');
-    const member = interaction.member;
-    const voiceChannel = member.voice.channel;
+    const voiceChannel = interaction.member.voice.channel;
     
-    // Check if user is in a voice channel
+    // Check if user is in voice
     if (!voiceChannel) {
-        const embed = new EmbedBuilder()
-            .setColor(0xFF0000)
-            .setDescription('❌ You must be in a voice channel to use this command!');
-        return await interaction.editReply({ embeds: [embed] });
+        return await interaction.editReply('❌ You need to be in a voice channel first!');
     }
     
     // Check bot permissions
-    const botMember = interaction.guild.members.me;
     if (!voiceChannel.joinable) {
-        const embed = new EmbedBuilder()
-            .setColor(0xFF0000)
-            .setDescription('❌ I don\'t have permission to join that voice channel!');
-        return await interaction.editReply({ embeds: [embed] });
+        return await interaction.editReply('❌ I cannot join your voice channel!');
     }
     
-    if (!voiceChannel.speakable) {
+    try {
+        // Get video info
+        const videoInfo = await playdl.video_info(link);
+        const title = videoInfo.video_details.title;
+        
+        // Get audio stream
+        const streamSource = await playdl.stream(link);
+        const resource = createAudioResource(streamSource.stream, {
+            inputType: streamSource.type
+        });
+        
+        // Join voice channel
+        const connection = joinVoiceChannel({
+            channelId: voiceChannel.id,
+            guildId: interaction.guildId,
+            adapterCreator: interaction.guild.voiceAdapterCreator
+        });
+        
+        // Create or reuse audio player
+        let player = activePlayers.get(interaction.guildId);
+        if (!player) {
+            player = createAudioPlayer();
+            connection.subscribe(player);
+            activePlayers.set(interaction.guildId, player);
+            
+            // Cleanup when done
+            player.on(AudioPlayerStatus.Idle, () => {
+                setTimeout(() => {
+                    if (player.state.status === AudioPlayerStatus.Idle) {
+                        connection.destroy();
+                        activePlayers.delete(interaction.guildId);
+                    }
+                }, 300000); // Disconnect after 5 min idle
+            });
+        }
+        
+        // Play the audio
+        player.play(resource);
+        
+        // Send success message
         const embed = new EmbedBuilder()
-            .setColor(0xFF0000)
-            .setDescription('❌ I don\'t have permission to speak in that voice channel!');
-        return await interaction.editReply({ embeds: [embed] });
-    }
-    
-    // Send to panel channel if configured
-    const panelChannel = client.channels.cache.get(process.env.PANEL_CHANNEL_ID);
-    if (panelChannel) {
-        const panelEmbed = new EmbedBuilder()
             .setColor(0x00FF00)
-            .setDescription(`🎵 ${interaction.user.tag} is playing music in ${voiceChannel.name}`);
-        await panelChannel.send({ embeds: [panelEmbed] });
+            .setTitle('🎵 Now Playing')
+            .setDescription(`[${title}](${link})`)
+            .setFooter({ text: `Requested by ${interaction.user.tag}` });
+        
+        await interaction.editReply({ embeds: [embed] });
+        
+        // Log to panel channel if configured
+        if (PANEL_CHANNEL_ID) {
+            const panelChannel = client.channels.cache.get(PANEL_CHANNEL_ID);
+            if (panelChannel) {
+                panelChannel.send(`🎵 ${interaction.user.tag} is playing: ${title}`);
+            }
+        }
+        
+        // Log to log channel if configured
+        if (LOG_CHANNEL_ID) {
+            const logChannel = client.channels.cache.get(LOG_CHANNEL_ID);
+            if (logChannel) {
+                logChannel.send(`📝 Music played by ${interaction.user.tag} in ${voiceChannel.name}: ${title}`);
+            }
+        }
+        
+    } catch (error) {
+        console.error(error);
+        await interaction.editReply('❌ Failed to play that link. Make sure it\'s a valid YouTube URL.');
     }
-    
-    await interaction.editReply('🎵 Processing your request...');
-    await playMusic(interaction.guildId, voiceChannel, interaction.channel, link);
 });
 
-client.login(process.env.BOT_TOKEN);
+client.login(TOKEN);
