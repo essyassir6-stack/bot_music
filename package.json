@@ -2,7 +2,7 @@
   "name": "discord-music-bot",
   "version": "1.0.0",
   "type": "module",
-  "description": "Simple Discord music bot with slash commands",
+  "description": "Simple Discord music bot for Railway",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
