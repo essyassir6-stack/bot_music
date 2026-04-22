@@ -1,19 +1,19 @@
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } from '@discordjs/voice';
-import { stream } from 'play-dl';
+import { stream, video_info } from 'play-dl';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Environment variables
+// Environment variables only - no hardcoded values
 const TOKEN = process.env.BOT_TOKEN;
 const PANEL_CHANNEL_ID = process.env.PANEL_CHANNEL_ID;
 const TICKET_CATEGORY_ID = process.env.TICKET_CATEGORY_ID;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 
-// Validate required env vars
+// Validate required token
 if (!TOKEN) {
-    console.error('❌ BOT_TOKEN is required in environment variables');
+    console.error('ERROR: BOT_TOKEN environment variable is required');
     process.exit(1);
 }
 
@@ -24,31 +24,31 @@ const client = new Client({
     ]
 });
 
-// Store active connections
-const activePlayers = new Map();
+// Store active connections per server
+const connections = new Map();
 
 client.once('ready', async () => {
-    console.log(`✅ Bot online as ${client.user.tag}`);
+    console.log(`Logged in as ${client.user.tag}`);
     
     // Register slash command
     const rest = new REST({ version: '10' }).setToken(TOKEN);
     
+    const commands = [
+        new SlashCommandBuilder()
+            .setName('ms')
+            .setDescription('Play music from a link in your voice channel')
+            .addStringOption(option =>
+                option.setName('link')
+                    .setDescription('YouTube or music link')
+                    .setRequired(true)
+            )
+    ];
+    
     try {
-        await rest.put(
-            Routes.applicationCommands(client.user.id),
-            { body: [
-                new SlashCommandBuilder()
-                    .setName('ms')
-                    .setDescription('Play music from a link')
-                    .addStringOption(option =>
-                        option.setName('link')
-                            .setDescription('YouTube or music link')
-                            .setRequired(true))
-            ] }
-        );
-        console.log('✅ Slash command /ms registered');
+        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+        console.log('Slash commands registered');
     } catch (error) {
-        console.error('Failed to register command:', error);
+        console.error('Failed to register commands:', error);
     }
 });
 
@@ -61,25 +61,24 @@ client.on('interactionCreate', async interaction => {
     const link = interaction.options.getString('link');
     const voiceChannel = interaction.member.voice.channel;
     
-    // Check if user is in voice
+    // Validation
     if (!voiceChannel) {
-        return await interaction.editReply('❌ You need to be in a voice channel first!');
+        return await interaction.editReply('❌ You must be in a voice channel first');
     }
     
-    // Check bot permissions
     if (!voiceChannel.joinable) {
-        return await interaction.editReply('❌ I cannot join your voice channel!');
+        return await interaction.editReply('❌ I cannot join your voice channel');
     }
     
     try {
         // Get video info
-        const videoInfo = await playdl.video_info(link);
-        const title = videoInfo.video_details.title;
+        const videoData = await video_info(link);
+        const title = videoData.video_details.title;
         
         // Get audio stream
-        const streamSource = await playdl.stream(link);
-        const resource = createAudioResource(streamSource.stream, {
-            inputType: streamSource.type
+        const audioStream = await stream(link);
+        const resource = createAudioResource(audioStream.stream, {
+            inputType: audioStream.type
         });
         
         // Join voice channel
@@ -89,49 +88,49 @@ client.on('interactionCreate', async interaction => {
             adapterCreator: interaction.guild.voiceAdapterCreator
         });
         
-        // Create or reuse audio player
-        let player = activePlayers.get(interaction.guildId);
+        // Create or get audio player
+        let player = connections.get(interaction.guildId);
         if (!player) {
             player = createAudioPlayer();
             connection.subscribe(player);
-            activePlayers.set(interaction.guildId, player);
+            connections.set(interaction.guildId, player);
             
-            // Cleanup when done
+            // Auto-disconnect after 5 minutes of inactivity
             player.on(AudioPlayerStatus.Idle, () => {
                 setTimeout(() => {
                     if (player.state.status === AudioPlayerStatus.Idle) {
                         connection.destroy();
-                        activePlayers.delete(interaction.guildId);
+                        connections.delete(interaction.guildId);
                     }
-                }, 300000); // Disconnect after 5 min idle
+                }, 300000);
             });
         }
         
-        // Play the audio
+        // Play music
         player.play(resource);
         
-        // Send success message
+        // Success response
         const embed = new EmbedBuilder()
             .setColor(0x00FF00)
             .setTitle('🎵 Now Playing')
             .setDescription(`[${title}](${link})`)
-            .setFooter({ text: `Requested by ${interaction.user.tag}` });
+            .setFooter({ text: `Requested by ${interaction.user.username}` });
         
         await interaction.editReply({ embeds: [embed] });
         
-        // Log to panel channel if configured
+        // Optional: Log to panel channel
         if (PANEL_CHANNEL_ID) {
             const panelChannel = client.channels.cache.get(PANEL_CHANNEL_ID);
             if (panelChannel) {
-                panelChannel.send(`🎵 ${interaction.user.tag} is playing: ${title}`);
+                panelChannel.send(`🎵 ${interaction.user.tag} played: ${title}`);
             }
         }
         
-        // Log to log channel if configured
+        // Optional: Log to log channel
         if (LOG_CHANNEL_ID) {
             const logChannel = client.channels.cache.get(LOG_CHANNEL_ID);
             if (logChannel) {
-                logChannel.send(`📝 Music played by ${interaction.user.tag} in ${voiceChannel.name}: ${title}`);
+                logChannel.send(`📝 ${interaction.user.tag} played "${title}" in ${voiceChannel.name}`);
             }
         }
         
